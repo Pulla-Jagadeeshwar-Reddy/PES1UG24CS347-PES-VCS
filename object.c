@@ -1,223 +1,224 @@
-// object.c — Content-addressable object store
+// tree.c — Tree object serialization and construction
 //
-// Every piece of data (file contents, directory listings, commits) is stored
-// as an "object" named by its SHA-256 hash. Objects are stored under
-// .pes/objects/XX/YYYYYY... where XX is the first two hex characters of the
-// hash (directory sharding).
+// PROVIDED functions: get_file_mode, tree_parse, tree_serialize
+// TODO functions:     tree_from_index
 //
-// PROVIDED functions: compute_hash, object_path, object_exists, hash_to_hex, hex_to_hash
-// TODO functions:     object_write, object_read
+// Binary tree format (per entry, concatenated with no separators):
+//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
+//
+// Example single entry (conceptual):
+//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
-#include "pes.h"
+#include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <openssl/evp.h>
 
-// ─── PROVIDED ────────────────────────────────────────────────────────────────
+// ─── Mode Constants ─────────────────────────────────────────────────────────
 
-void hash_to_hex(const ObjectID *id, char *hex_out) {
-    for (int i = 0; i < HASH_SIZE; i++) {
-        sprintf(hex_out + i * 2, "%02x", id->hash[i]);
-    }
-    hex_out[HASH_HEX_SIZE] = '\0';
+#define MODE_FILE      0100644
+#define MODE_EXEC      0100755
+#define MODE_DIR       0040000
+
+// ─── PROVIDED ───────────────────────────────────────────────────────────────
+
+// Determine the object mode for a filesystem path.
+uint32_t get_file_mode(const char *path) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return 0;
+
+    if (S_ISDIR(st.st_mode))  return MODE_DIR;
+    if (st.st_mode & S_IXUSR) return MODE_EXEC;
+    return MODE_FILE;
 }
 
-int hex_to_hash(const char *hex, ObjectID *id_out) {
-    if (strlen(hex) < HASH_HEX_SIZE) return -1;
-    for (int i = 0; i < HASH_SIZE; i++) {
-        unsigned int byte;
-        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return -1;
-        id_out->hash[i] = (uint8_t)byte;
+// Parse binary tree data into a Tree struct safely.
+// Returns 0 on success, -1 on parse error.
+int tree_parse(const void *data, size_t len, Tree *tree_out) {
+    tree_out->count = 0;
+    const uint8_t *ptr = (const uint8_t *)data;
+    const uint8_t *end = ptr + len;
+
+    while (ptr < end && tree_out->count < MAX_TREE_ENTRIES) {
+        TreeEntry *entry = &tree_out->entries[tree_out->count];
+
+        // 1. Safely find the space character for the mode
+        const uint8_t *space = memchr(ptr, ' ', end - ptr);
+        if (!space) return -1; // Malformed data
+
+        // Parse mode into an isolated buffer
+        char mode_str[16] = {0};
+        size_t mode_len = space - ptr;
+        if (mode_len >= sizeof(mode_str)) return -1;
+        memcpy(mode_str, ptr, mode_len);
+        entry->mode = strtol(mode_str, NULL, 8);
+
+        ptr = space + 1; // Skip space
+
+        // 2. Safely find the null terminator for the name
+        const uint8_t *null_byte = memchr(ptr, '\0', end - ptr);
+        if (!null_byte) return -1; // Malformed data
+
+        size_t name_len = null_byte - ptr;
+        if (name_len >= sizeof(entry->name)) return -1;
+        memcpy(entry->name, ptr, name_len);
+        entry->name[name_len] = '\0'; // Ensure null-terminated
+
+        ptr = null_byte + 1; // Skip null byte
+
+        // 3. Read the 32-byte binary hash
+        if (ptr + HASH_SIZE > end) return -1; 
+        memcpy(entry->hash.hash, ptr, HASH_SIZE);
+        ptr += HASH_SIZE;
+
+        tree_out->count++;
     }
     return 0;
 }
 
-void compute_hash(const void *data, size_t len, ObjectID *id_out) {
-    unsigned int hash_len;
-    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
-    EVP_DigestUpdate(ctx, data, len);
-    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
-    EVP_MD_CTX_free(ctx);
+// Helper for qsort to ensure consistent tree hashing
+static int compare_tree_entries(const void *a, const void *b) {
+    return strcmp(((const TreeEntry *)a)->name, ((const TreeEntry *)b)->name);
 }
 
-// Get the filesystem path where an object should be stored.
-// Format: .pes/objects/XX/YYYYYYYY...
-// The first 2 hex chars form the shard directory; the rest is the filename.
-void object_path(const ObjectID *id, char *path_out, size_t path_size) {
-    char hex[HASH_HEX_SIZE + 1];
-    hash_to_hex(id, hex);
-    snprintf(path_out, path_size, "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
-}
+// Serialize a Tree struct into binary format for storage.
+// Caller must free(*data_out).
+// Returns 0 on success, -1 on error.
+int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
+    // Estimate max size: (6 bytes mode + 1 byte space + 256 bytes name + 1 byte null + 32 bytes hash) per entry
+    size_t max_size = tree->count * 296; 
+    uint8_t *buffer = malloc(max_size);
+    if (!buffer) return -1;
 
-int object_exists(const ObjectID *id) {
-    char path[512];
-    object_path(id, path, sizeof(path));
-    return access(path, F_OK) == 0;
+    // Create a mutable copy to sort entries (Git requirement)
+    Tree sorted_tree = *tree;
+    qsort(sorted_tree.entries, sorted_tree.count, sizeof(TreeEntry), compare_tree_entries);
+
+    size_t offset = 0;
+    for (int i = 0; i < sorted_tree.count; i++) {
+        const TreeEntry *entry = &sorted_tree.entries[i];
+        
+        // Write mode and name (%o writes octal correctly for Git standards)
+        int written = sprintf((char *)buffer + offset, "%o %s", entry->mode, entry->name);
+        offset += written + 1; // +1 to step over the null terminator written by sprintf
+        
+        // Write binary hash
+        memcpy(buffer + offset, entry->hash.hash, HASH_SIZE);
+        offset += HASH_SIZE;
+    }
+
+    *data_out = buffer;
+    *len_out = offset;
+    return 0;
 }
 
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
-// Write an object to the store.
+// Build a tree hierarchy from the current index and write all tree
+// objects to the object store.
 //
-// Object format on disk:
-//   "<type> <size>\0<data>"
-//   where <type> is "blob", "tree", or "commit"
-//   and <size> is the decimal string of the data length
-//
-// Steps:
-//   1. Build the full object: header ("blob 16\0") + data
-//   2. Compute SHA-256 hash of the FULL object (header + data)
-//   3. Check if object already exists (deduplication) — if so, just return success
-//   4. Create shard directory (.pes/objects/XX/) if it doesn't exist
-//   5. Write to a temporary file in the same shard directory
-//   6. fsync() the temporary file to ensure data reaches disk
-//   7. rename() the temp file to the final path (atomic on POSIX)
-//   8. Open and fsync() the shard directory to persist the rename
-//   9. Store the computed hash in *id_out
-
-// HINTS - Useful syscalls and functions for this phase:
-//   - sprintf / snprintf : formatting the header string
-//   - compute_hash       : hashing the combined header + data
-//   - object_exists      : checking for deduplication
-//   - mkdir              : creating the shard directory (use mode 0755)
-//   - open, write, close : creating and writing to the temp file
-//                          (Use O_CREAT | O_WRONLY | O_TRUNC, mode 0644)
-//   - fsync              : flushing the file descriptor to disk
-//   - rename             : atomically moving the temp file to the final path
-//
-
+// HINTS - Useful functions and concepts for this phase:
+//   - index_load      : load the staged files into memory
+//   - strchr          : find the first '/' in a path to separate directories from files
+//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
+//   - Recursion       : you will likely want to create a recursive helper function 
+//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
+//   - tree_serialize  : convert your populated Tree struct into a binary buffer
+//   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
-int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    const char *type_str = (type == OBJ_BLOB) ? "blob" :
-                           (type == OBJ_TREE) ? "tree" : "commit";
+// Forward declarations
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+__attribute__((weak)) int index_load(Index *index);
 
-    // 1. Build header: "<type> <size>\0"
-    char header[64];
-    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1; // +1 for \0
+// Recursive helper: build tree from a slice of index entries sharing a common prefix.
+// 'prefix' is the current directory path (empty string for root).
+// 'entries' is the full array; 'count' is total entries.
+// Only processes entries whose path starts with 'prefix'.
+static int write_tree_level(const IndexEntry *entries, int count,
+                             const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+    size_t prefix_len = strlen(prefix);
 
-    // 2. Build full object = header + data
-    size_t full_len = (size_t)header_len + len;
-    uint8_t *full = malloc(full_len);
-    if (!full) return -1;
-    memcpy(full, header, header_len);
-    memcpy(full + header_len, data, len);
+    int i = 0;
+    while (i < count) {
+        const char *path = entries[i].path;
 
-    // 3. Compute hash of full object
-    compute_hash(full, full_len, id_out);
+        // Skip entries not under this prefix
+        if (prefix_len > 0) {
+            if (strncmp(path, prefix, prefix_len) != 0 || path[prefix_len] != '/') {
+                i++;
+                continue;
+            }
+            path = path + prefix_len + 1; // strip prefix + '/'
+        }
 
-    // 4. Check for deduplication
-    if (object_exists(id_out)) {
-        free(full);
-        return 0;
+        // Find next '/' — if present, this is a subdirectory
+        const char *slash = strchr(path, '/');
+
+        if (!slash) {
+            // Direct file entry
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = entries[i].mode;
+            te->hash = entries[i].hash;
+            snprintf(te->name, sizeof(te->name), "%s", path);
+            i++;
+        } else {
+            // Subdirectory — collect all entries under this subdir
+            size_t dir_name_len = (size_t)(slash - path);
+            char dir_name[256];
+            if (dir_name_len >= sizeof(dir_name)) return -1;
+            memcpy(dir_name, path, dir_name_len);
+            dir_name[dir_name_len] = '\0';
+
+            // Build new prefix for recursion
+            char sub_prefix[512];
+            if (prefix_len > 0)
+                snprintf(sub_prefix, sizeof(sub_prefix), "%s/%s", prefix, dir_name);
+            else
+                snprintf(sub_prefix, sizeof(sub_prefix), "%s", dir_name);
+
+            ObjectID subtree_id;
+            if (write_tree_level(entries, count, sub_prefix, &subtree_id) != 0)
+                return -1;
+
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = 0040000;
+            te->hash = subtree_id;
+            snprintf(te->name, sizeof(te->name), "%s", dir_name);
+
+            // Skip all entries under this subdir
+            while (i < count) {
+                const char *p = entries[i].path;
+                if (prefix_len > 0) {
+                    if (strncmp(p, prefix, prefix_len) != 0 || p[prefix_len] != '/')
+                        break;
+                    p = p + prefix_len + 1;
+                }
+                if (strncmp(p, dir_name, dir_name_len) == 0 &&
+                    (p[dir_name_len] == '/' || p[dir_name_len] == '\0'))
+                    i++;
+                else
+                    break;
+            }
+        }
     }
 
-    // 5. Create shard directory
-    char obj_path[512];
-    object_path(id_out, obj_path, sizeof(obj_path));
-    char shard_dir[512];
-    snprintf(shard_dir, sizeof(shard_dir), "%s", obj_path);
-    // shard_dir is like .pes/objects/XX/YYY..., strip filename
-    char *last_slash = strrchr(shard_dir, '/');
-    if (!last_slash) { free(full); return -1; }
-    *last_slash = '\0';
-    mkdir(shard_dir, 0755);
-
-    // 6. Write to temp file
-    char tmp_path[528];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", obj_path);
-    int fd = open(tmp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
-    if (fd < 0) { free(full); return -1; }
-    if (write(fd, full, full_len) != (ssize_t)full_len) {
-        close(fd); free(full); return -1;
-    }
-    free(full);
-
-    // 7. fsync + rename
-    fsync(fd);
-    close(fd);
-    if (rename(tmp_path, obj_path) != 0) return -1;
-
-    // 8. fsync shard directory
-    int dir_fd = open(shard_dir, O_RDONLY);
-    if (dir_fd >= 0) { fsync(dir_fd); close(dir_fd); }
-
-    return 0;
+    // Serialize and write tree
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+    int rc = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return rc;
 }
 
-// Read an object from the store.
-//
-// Steps:
-//   1. Build the file path from the hash using object_path()
-//   2. Open and read the entire file
-//   3. Parse the header to extract the type string and size
-//   4. Verify integrity: recompute the SHA-256 of the file contents
-//      and compare to the expected hash (from *id). Return -1 if mismatch.
-//   5. Set *type_out to the parsed ObjectType
-//   6. Allocate a buffer, copy the data portion (after the \0), set *data_out and *len_out
-//
-// HINTS - Useful syscalls and functions for this phase:
-//   - object_path        : getting the target file path
-//   - fopen, fread, fseek: reading the file into memory
-//   - memchr             : safely finding the '\0' separating header and data
-//   - strncmp            : parsing the type string ("blob", "tree", "commit")
-//   - compute_hash       : re-hashing the read data for integrity verification
-//   - memcmp             : comparing the computed hash against the requested hash
-//   - malloc, memcpy     : allocating and returning the extracted data
-//
-// The caller is responsible for calling free(*data_out).
-// Returns 0 on success, -1 on error (file not found, corrupt, etc.).
-int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    char path[512];
-    object_path(id, path, sizeof(path));
-
-    // 1. Open and read entire file
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (file_size <= 0) { fclose(f); return -1; }
-
-    uint8_t *buf = malloc((size_t)file_size);
-    if (!buf) { fclose(f); return -1; }
-    if ((long)fread(buf, 1, (size_t)file_size, f) != file_size) {
-        free(buf); fclose(f); return -1;
-    }
-    fclose(f);
-
-    // 2. Integrity check
-    ObjectID computed;
-    compute_hash(buf, (size_t)file_size, &computed);
-    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
-        free(buf); return -1;
-    }
-
-    // 3. Find null separator between header and data
-    uint8_t *null_byte = memchr(buf, '\0', (size_t)file_size);
-    if (!null_byte) { free(buf); return -1; }
-
-    // 4. Parse type
-    if (strncmp((char *)buf, "blob ", 5) == 0) *type_out = OBJ_BLOB;
-    else if (strncmp((char *)buf, "tree ", 5) == 0) *type_out = OBJ_TREE;
-    else if (strncmp((char *)buf, "commit ", 7) == 0) *type_out = OBJ_COMMIT;
-    else { free(buf); return -1; }
-
-    // 5. Extract data portion
-    uint8_t *data_start = null_byte + 1;
-    size_t data_len = (size_t)(buf + file_size - data_start);
-
-    *data_out = malloc(data_len + 1);
-    if (!*data_out) { free(buf); return -1; }
-    memcpy(*data_out, data_start, data_len);
-    ((uint8_t *)*data_out)[data_len] = '\0';
-    *len_out = data_len;
-
-    free(buf);
-    return 0;
+int tree_from_index(ObjectID *id_out) {
+    Index index;
+    if (index_load(&index) != 0) return -1;
+    return write_tree_level(index.entries, index.count, "", id_out);
 }
